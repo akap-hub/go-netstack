@@ -34,6 +34,11 @@ func cleanup_graph_resources(graph *Graph) {
 	// to avoid race conditions with goroutines accessing closed sockets
 	for _, node := range graph.node_list {
 		if node != nil {
+			// Stop RIP daemon
+			if node.rip_state != nil {
+				node.rip_state.StopRIP()
+			}
+
 			// Stop MAC table cleanup goroutine
 			stop_mac_table_cleanup(node)
 
@@ -105,6 +110,8 @@ func init_node_nw_props(node_nw_props *NodeNwProp) {
 	init_arp_table(&node_nw_props.arp_table)
 	// Initialize MAC table for L2 switching
 	init_mac_table(&node_nw_props.mac_table)
+	// Initialize routing table for L3 routing
+	node_nw_props.rt_table = InitRoutingTable()
 }
 
 func init_intf_nw_props(intf_nw_props *IntfNwProps) {
@@ -138,6 +145,9 @@ func create_graph_node(graph *Graph, node_name string) *Node {
 	node := &Node{}
 	copy(node.node_name[:], node_name)
 	init_node_nw_props(&node.node_nw_prop)
+
+	// Initialize RIP state
+	node.rip_state = InitRIPState(node)
 
 	// Initialize UDP socket for the node
 	err := init_node_udp_socket(node)

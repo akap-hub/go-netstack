@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -109,15 +110,24 @@ func deserialize_arp_header(buffer []byte) (*arp_hdr_t, error) {
 	return hdr, nil
 }
 
+// arp_pending_entry represents a packet waiting for ARP resolution
+type arp_pending_entry struct {
+	pkt      []byte                       // Complete packet (including Ethernet header)
+	pkt_size int                          // Packet size
+	callback func(*Node, *Interface, []byte, int) // Callback to process packet after ARP resolves
+	next     *arp_pending_entry           // Next pending entry
+}
+
 // arp_entry represents a single ARP table entry
 type arp_entry struct {
-	ip_addr    IpAddr             // Key: IP address (4 bytes)
-	mac_addr   MacAddr            // Resolved MAC address (6 bytes)
-	oif_name   [IF_NAME_SIZE]byte // Outgoing interface name
-	is_sane    bool               // Entry validity flag
-	created_at time.Time          // When the entry was created
-	updated_at time.Time          // Last time entry was updated
-	next       *arp_entry         // Next entry in linked list (simulating glthread)
+	ip_addr      IpAddr             // Key: IP address (4 bytes)
+	mac_addr     MacAddr            // Resolved MAC address (6 bytes)
+	oif_name     [IF_NAME_SIZE]byte // Outgoing interface name
+	is_sane      bool               // Entry validity flag (false = complete, true = pending ARP resolution)
+	created_at   time.Time          // When the entry was created
+	updated_at   time.Time          // Last time entry was updated
+	pending_list *arp_pending_entry // List of packets waiting for ARP resolution
+	next         *arp_entry         // Next entry in linked list (simulating glthread)
 }
 
 // arp_table represents the ARP table for a node
@@ -190,8 +200,9 @@ func arp_table_lookup(table *arp_table, ip_addr *IpAddr) *MacAddr {
 	defer table.mutex.RUnlock()
 
 	// Search through linked list
+	// Only return MAC if entry is complete (is_sane = false means complete)
 	for current := table.head; current != nil; current = current.next {
-		if current.is_sane && current.ip_addr == *ip_addr {
+		if current.ip_addr == *ip_addr && !current.is_sane {
 			return &current.mac_addr
 		}
 	}
@@ -305,6 +316,109 @@ func arp_table_cleanup_expired(table *arp_table) int {
 	return removed
 }
 
+// add_arp_pending_entry adds a packet to the pending list for an ARP entry
+// This is called when a packet needs to be sent but ARP resolution is still pending
+func add_arp_pending_entry(entry *arp_entry, pkt []byte, pkt_size int, callback func(*Node, *Interface, []byte, int)) {
+	if entry == nil || pkt == nil || pkt_size <= 0 {
+		return
+	}
+
+	// Create a copy of the packet
+	pkt_copy := make([]byte, pkt_size)
+	copy(pkt_copy, pkt[:pkt_size])
+
+	// Create pending entry
+	pending := &arp_pending_entry{
+		pkt:      pkt_copy,
+		pkt_size: pkt_size,
+		callback: callback,
+		next:     entry.pending_list, // Insert at head
+	}
+
+	// Add to pending list
+	entry.pending_list = pending
+	LogDebug("ARP: Added pending packet to queue for IP %s (%d bytes)", entry.ip_addr.String(), pkt_size)
+}
+
+// process_arp_pending_entry processes a single pending packet after ARP is resolved
+func process_arp_pending_entry(node *Node, oif *Interface, arp_entry *arp_entry, pending *arp_pending_entry) {
+	if node == nil || oif == nil || arp_entry == nil || pending == nil {
+		return
+	}
+
+	LogInfo("ARP: Processing pending packet for %s (MAC: %s) - %d bytes",
+		arp_entry.ip_addr.String(), arp_entry.mac_addr.String(), pending.pkt_size)
+
+	// Call the callback to send the packet
+	if pending.callback != nil {
+		pending.callback(node, oif, pending.pkt, pending.pkt_size)
+	}
+}
+
+// process_all_arp_pending_entries processes all pending packets for an ARP entry
+func process_all_arp_pending_entries(node *Node, oif *Interface, arp_entry *arp_entry) {
+	if node == nil || oif == nil || arp_entry == nil {
+		return
+	}
+
+	count := 0
+	for pending := arp_entry.pending_list; pending != nil; pending = pending.next {
+		process_arp_pending_entry(node, oif, arp_entry, pending)
+		count++
+	}
+
+	if count > 0 {
+		LogInfo("ARP: Processed %d pending packet(s) for %s", count, arp_entry.ip_addr.String())
+	}
+
+	// Clear the pending list
+	arp_entry.pending_list = nil
+}
+
+// create_arp_sane_entry creates a "sane" (incomplete) ARP entry for pending resolution
+// is_sane = true means ARP resolution is pending (entry exists but MAC is not yet known)
+// is_sane = false means entry is complete (MAC address is resolved)
+func create_arp_sane_entry(table *arp_table, ip_addr *IpAddr) *arp_entry {
+	if table == nil || ip_addr == nil {
+		return nil
+	}
+
+	table.mutex.Lock()
+	defer table.mutex.Unlock()
+
+	// Check if entry already exists
+	for current := table.head; current != nil; current = current.next {
+		if current.ip_addr == *ip_addr {
+			// Entry exists
+			if !current.is_sane {
+				// Complete entry exists - shouldn't create sane entry
+				LogError("ARP: Attempted to create sane entry when complete entry exists for %s", ip_addr.String())
+				return nil
+			}
+			// Sane entry already exists, return it
+			return current
+		}
+	}
+
+	// Create new sane entry
+	now := time.Now()
+	entry := &arp_entry{
+		ip_addr:      *ip_addr,
+		mac_addr:     MacAddr{}, // Empty MAC
+		is_sane:      true,      // Pending ARP resolution
+		created_at:   now,
+		updated_at:   now,
+		pending_list: nil,
+		next:         table.head,
+	}
+
+	// Insert at head
+	table.head = entry
+
+	LogDebug("ARP: Created sane (pending) entry for %s", ip_addr.String())
+	return entry
+}
+
 // starts ARP table cleanup goroutine for a node
 func start_arp_table_cleanup(node *Node) {
 	if node == nil {
@@ -386,8 +500,8 @@ func arp_table_dump(table *arp_table, node_name string) {
 		}
 
 		status := "Valid"
-		if !current.is_sane {
-			status = "Invalid"
+		if current.is_sane {
+			status = "Pending"
 		}
 
 		fmt.Printf("%-15s %-17s %-16s %s\n", ip_str, mac_str, oif_name, status)
@@ -490,19 +604,16 @@ func send_arp_broadcast_request(node *Node, oif *Interface, ip_addr string) int 
 	// Serialize frame to bytes
 	frame_bytes := serialize_ethernet_frame(frame)
 
-	// ARP requests use broadcast MAC - flood to all interfaces on the local segment
-	// This simulates how switches/hubs forward broadcast frames to all ports
-	LogInfo("ARP: Broadcasting request for %s from interface %s", ip_addr, get_interface_name(out_intf))
+	// Send ARP request out the specific outgoing interface
+	// The broadcast MAC will cause it to be received by all nodes on that link segment
+	fmt.Printf("→ ARP Request: %s broadcasting for %s\n", get_node_name(node), ip_addr)
 
-	// Flood the ARP request to all interfaces of the node except the outgoing one
-	// In a real network, switches would do this automatically for broadcast MAC
-	sent_count := send_pkt_flood(node, nil, frame_bytes, len(frame_bytes))
-	if sent_count <= 0 {
-		LogError("ARP: failed to broadcast request (no interfaces available)")
+	err := send_udp_packet(frame_bytes, len(frame_bytes), out_intf)
+	if err != nil {
+		LogError("ARP: failed to send broadcast request: %v", err)
 		return -1
 	}
 
-	LogDebug("ARP: request broadcasted to %d interface(s)", sent_count)
 	return 0
 }
 
@@ -510,9 +621,10 @@ func send_arp_broadcast_request(node *Node, oif *Interface, ip_addr string) int 
 // Args:
 //   - pkt_buffer: the incoming packet buffer containing Ethernet + ARP headers
 //   - oif: output interface to send the reply on
-func send_arp_reply_msg_from_packet(pkt_buffer []byte, oif *Interface) {
-	if pkt_buffer == nil || oif == nil {
-		LogError("ARP: nil parameter in send_arp_reply_msg_from_packet")
+//   - reply_ip: the IP address to use in the ARP reply (e.g., VLAN interface IP or physical interface IP)
+func send_arp_reply_msg(pkt_buffer []byte, oif *Interface, reply_ip *IpAddr) {
+	if pkt_buffer == nil || oif == nil || reply_ip == nil {
+		LogError("ARP: nil parameter in send_arp_reply_msg")
 		return
 	}
 
@@ -535,13 +647,10 @@ func send_arp_reply_msg_from_packet(pkt_buffer []byte, oif *Interface) {
 	src_mac := oif.GetMac()
 	arp_hdr_reply.src_mac = *src_mac
 
-	// Source IP: our interface IP (store in host byte order)
-	if oif.IsIPConfigured() {
-		src_ip := oif.GetIP()
-		var src_ip_uint32 uint32
-		if ip_addr_str_to_int32(src_ip.String(), &src_ip_uint32) {
-			arp_hdr_reply.src_ip = src_ip_uint32
-		}
+	// Source IP: use the provided reply IP (could be physical interface IP or VLAN interface IP)
+	var src_ip_uint32 uint32
+	if ip_addr_str_to_int32(reply_ip.String(), &src_ip_uint32) {
+		arp_hdr_reply.src_ip = src_ip_uint32
 	}
 
 	// Destination MAC: source MAC from incoming request
@@ -569,7 +678,16 @@ func send_arp_reply_msg_from_packet(pkt_buffer []byte, oif *Interface) {
 	frame_bytes := serialize_ethernet_frame(frame)
 
 	// Send the reply
-	LogInfo("ARP: Sending reply to %s out interface %s", arp_hdr_in.src_mac.String(), get_interface_name(oif))
+	// Convert target IP to string for display
+	var reply_to_ip [16]byte
+	ip_addr_int32_to_str(arp_hdr_in.src_ip, reply_to_ip[:])
+	reply_ip_str := string(reply_to_ip[:])
+	if idx := strings.IndexByte(reply_ip_str, 0); idx != -1 {
+		reply_ip_str = reply_ip_str[:idx]
+	}
+	fmt.Printf("← ARP Reply: %s -> %s (%s is at %s)\n", 
+		get_node_name(oif.att_node), reply_ip_str, 
+		reply_ip.String(), src_mac.String())
 
 	send_err := send_udp_packet(frame_bytes, len(frame_bytes), oif)
 	if send_err != nil {
@@ -607,18 +725,74 @@ func process_arp_reply_msg(node *Node, iif *Interface, pkt_buffer []byte) {
 	// Update ARP table with the resolved MAC address
 	// Create IP address from the ARP reply
 	var ip_addr IpAddr
-	if set_ip_addr(&ip_addr, string(ip_str[:])) {
-		// Try to update existing entry first
-		if !arp_table_update_entry(&node.node_nw_prop.arp_table, &ip_addr, &arp_hdr.src_mac, get_interface_name(iif)) {
-			// Entry doesn't exist, add it
-			if arp_table_add_entry(&node.node_nw_prop.arp_table, &ip_addr, &arp_hdr.src_mac, get_interface_name(iif)) {
-				LogInfo("ARP: Added new table entry: %s -> %s via %s", ip_addr.String(), arp_hdr.src_mac.String(), get_interface_name(iif))
-			} else {
-				LogError("ARP: Failed to add entry to table")
+	// Trim null bytes from the IP string
+	ip_str_trimmed := string(ip_str[:])
+	if idx := strings.IndexByte(ip_str_trimmed, 0); idx != -1 {
+		ip_str_trimmed = ip_str_trimmed[:idx]
+	}
+	LogInfo("ARP: Processing reply - IP string: '%s', MAC: %s", ip_str_trimmed, arp_hdr.src_mac.String())
+	if set_ip_addr(&ip_addr, ip_str_trimmed) {
+		LogInfo("ARP: IP address parsed successfully: %s", ip_addr.String())
+		
+		// Lock the table to safely check and update
+		node.node_nw_prop.arp_table.mutex.Lock()
+		
+		// Find the entry (might be sane/pending or complete)
+		var entry_found *arp_entry
+		for current := node.node_nw_prop.arp_table.head; current != nil; current = current.next {
+			if current.ip_addr == ip_addr {
+				entry_found = current
+				break
 			}
-		} else {
-			LogInfo("ARP: Updated table entry: %s -> %s via %s", ip_addr.String(), arp_hdr.src_mac.String(), get_interface_name(iif))
 		}
+		
+		if entry_found == nil {
+			// No entry exists, create new one
+			now := time.Now()
+			entry_found = &arp_entry{
+				ip_addr:      ip_addr,
+				mac_addr:     arp_hdr.src_mac,
+				is_sane:      false, // Complete entry
+				created_at:   now,
+				updated_at:   now,
+				pending_list: nil,
+				next:         node.node_nw_prop.arp_table.head,
+			}
+			copy(entry_found.oif_name[:], []byte(get_interface_name(iif)))
+			node.node_nw_prop.arp_table.head = entry_found
+			node.node_nw_prop.arp_table.mutex.Unlock()
+			
+			fmt.Printf("✓ ARP Resolved: %s learned %s is at %s\n", 
+				get_node_name(node), ip_addr.String(), arp_hdr.src_mac.String())
+		} else {
+			// Entry exists - update it
+			entry_found.mac_addr = arp_hdr.src_mac
+			entry_found.is_sane = false // Now complete
+			entry_found.updated_at = time.Now()
+			copy(entry_found.oif_name[:], []byte(get_interface_name(iif)))
+			
+			// Get pending list before unlocking
+			pending_list := entry_found.pending_list
+			entry_found.pending_list = nil // Clear it
+			node.node_nw_prop.arp_table.mutex.Unlock()
+			
+			fmt.Printf("✓ ARP Resolved: %s updated %s is at %s\n", 
+				get_node_name(node), ip_addr.String(), arp_hdr.src_mac.String())
+			
+			// Process all pending packets for this ARP entry
+			if pending_list != nil {
+				count := 0
+				for pending := pending_list; pending != nil; pending = pending.next {
+					process_arp_pending_entry(node, iif, entry_found, pending)
+					count++
+				}
+				if count > 0 {
+					fmt.Printf("  ↳ Sent %d queued packet(s)\n", count)
+				}
+			}
+		}
+	} else {
+		LogError("ARP: Failed to parse IP address from reply: '%s'", string(ip_str[:]))
 	}
 }
 
@@ -653,30 +827,49 @@ func process_arp_broadcast_request(node *Node, iif *Interface, pkt_buffer []byte
 		return
 	}
 
-	// Check if the destination IP matches our interface IP
+	// Convert target IP string for comparison
+	ip_str_clean := string(ip_addr_str[:])
+	// Find the null terminator
+	for i, b := range ip_addr_str {
+		if b == 0 {
+			ip_str_clean = string(ip_addr_str[:i])
+			break
+		}
+	}
+	
+	var target_ip IpAddr
+	if !set_ip_addr(&target_ip, ip_str_clean) {
+		LogError("ARP: could not parse target IP address")
+		return
+	}
+	
+	// Check if the destination IP matches our physical interface IP
+	shouldReply := false
 	if iif.IsIPConfigured() {
 		iif_ip := iif.GetIP()
-		var target_ip IpAddr
-		// Null-terminate the string
-		ip_str_clean := string(ip_addr_str[:])
-		// Find the null terminator
-		for i, b := range ip_addr_str {
-			if b == 0 {
-				ip_str_clean = string(ip_addr_str[:i])
+		if ip_addr_equal(iif_ip, &target_ip) {
+			shouldReply = true
+			LogDebug("ARP: Target IP %s matches interface IP", target_ip.String())
+		}
+	}
+	
+	// Also check if target IP matches any VLAN interface (SVI) on this node
+	if !shouldReply && node.node_nw_prop.vlan_interfaces != nil {
+		for _, vlan_intf := range node.node_nw_prop.vlan_interfaces {
+			if ip_addr_equal(&vlan_intf.ip_addr, &target_ip) {
+				shouldReply = true
+				LogDebug("ARP: Target IP %s matches VLAN interface", target_ip.String())
 				break
 			}
 		}
-
-		if set_ip_addr(&target_ip, ip_str_clean) {
-			if !ip_addr_equal(iif_ip, &target_ip) {
-				LogDebug("ARP: Broadcast request dropped, Dst IP %s did not match interface IP %s",
-					target_ip.String(), iif_ip.String())
-				return
-			}
-		}
+	}
+	
+	if !shouldReply {
+		LogDebug("ARP: Broadcast request dropped, Dst IP %s did not match any interface",
+			target_ip.String())
+		return
 	}
 
-	// The destination IP matches our interface IP - send ARP reply
-	LogInfo("ARP: Destination IP matches, sending reply")
-	send_arp_reply_msg_from_packet(pkt_buffer, iif)
+	// The destination IP matches one of our IPs - send ARP reply with the correct IP
+	send_arp_reply_msg(pkt_buffer, iif, &target_ip)
 }

@@ -16,8 +16,8 @@ const (
 )
 
 var (
-	currentLogLevel = INFO // Default log level
-	logger          = log.New(os.Stdout, "", log.Ldate|log.Ltime|log.Lmicroseconds)
+	currentLogLevel = DEBUG // Temporarily DEBUG for testing
+	logger          = log.New(os.Stdout, "", log.Ldate|log.Ltime)
 )
 
 // SetLogLevel sets the minimum log level to display

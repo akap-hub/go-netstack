@@ -119,6 +119,356 @@ var resolveArpCmd = &cobra.Command{
 	},
 }
 
+var showNodeRouteCmd = &cobra.Command{
+	Use:   "route [node-name]",
+	Short: "Show routing table for a node",
+	Args:  cobra.ExactArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		nodeName := args[0]
+
+		if currentTopology == nil {
+			fmt.Println("Error: No topology loaded. Use 'load topology [filename]' first.")
+			return
+		}
+
+		// Find the node
+		var targetNode *Node
+		for _, node := range currentTopology.node_list {
+			if get_node_name(node) == nodeName {
+				targetNode = node
+				break
+			}
+		}
+
+		if targetNode == nil {
+			LogError("Node '%s' not found in topology", nodeName)
+			fmt.Printf("Error: Node '%s' not found in topology\n", nodeName)
+			return
+		}
+
+		// Dump the routing table
+		targetNode.node_nw_prop.rt_table.DumpRoutingTable(nodeName)
+	},
+}
+
+var showNodeArpCmd = &cobra.Command{
+	Use:   "arp [node-name]",
+	Short: "Show ARP table for a node",
+	Args:  cobra.ExactArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		nodeName := args[0]
+
+		if currentTopology == nil {
+			fmt.Println("Error: No topology loaded. Use 'load topology [filename]' first.")
+			return
+		}
+
+		// Find the node
+		var targetNode *Node
+		for _, node := range currentTopology.node_list {
+			if get_node_name(node) == nodeName {
+				targetNode = node
+				break
+			}
+		}
+
+		if targetNode == nil {
+			LogError("Node '%s' not found in topology", nodeName)
+			fmt.Printf("Error: Node '%s' not found in topology\n", nodeName)
+			return
+		}
+
+		// Dump the ARP table
+		arp_table_dump(&targetNode.node_nw_prop.arp_table, nodeName)
+	},
+}
+
+var addRouteCmd = &cobra.Command{
+	Use:   "add-route [node-name] [dest-ip/mask] [gateway-ip] [oif]",
+	Short: "Add a route to a node's routing table",
+	Args:  cobra.ExactArgs(4),
+	Run: func(cmd *cobra.Command, args []string) {
+		nodeName := args[0]
+		destCIDR := args[1]
+		gatewayIP := args[2]
+		oif := args[3]
+
+		if currentTopology == nil {
+			fmt.Println("Error: No topology loaded. Use 'load topology [filename]' first.")
+			return
+		}
+
+		// Find the node
+		var targetNode *Node
+		for _, node := range currentTopology.node_list {
+			if get_node_name(node) == nodeName {
+				targetNode = node
+				break
+			}
+		}
+
+		if targetNode == nil {
+			LogError("Node '%s' not found in topology", nodeName)
+			fmt.Printf("Error: Node '%s' not found in topology\n", nodeName)
+			return
+		}
+
+		// Parse CIDR (e.g., "192.168.1.0/24")
+		parts := strings.Split(destCIDR, "/")
+		if len(parts) != 2 {
+			fmt.Printf("Error: Invalid CIDR format. Use: dest-ip/mask (e.g., 192.168.1.0/24)\n")
+			return
+		}
+
+		destIP := parts[0]
+		maskStr := parts[1]
+		
+		// Parse mask
+		var mask uint8
+		_, err := fmt.Sscanf(maskStr, "%d", &mask)
+		if err != nil || mask > 32 {
+			fmt.Printf("Error: Invalid mask: %s (must be 0-32)\n", maskStr)
+			return
+		}
+
+		// Add route
+		err = targetNode.node_nw_prop.rt_table.AddRoute(destIP, mask, gatewayIP, oif)
+		if err != nil {
+			LogError("Failed to add route: %v", err)
+			fmt.Printf("Error: Failed to add route: %v\n", err)
+			return
+		}
+
+		fmt.Printf("Successfully added route on node %s: %s via %s (%s)\n",
+			nodeName, destCIDR, gatewayIP, oif)
+	},
+}
+
+var addVlanInterfaceCmd = &cobra.Command{
+	Use:   "add-vlan-interface [node-name] [vlan-id] [ip-address] [mask]",
+	Short: "Add a VLAN interface (SVI) to a node for inter-VLAN routing",
+	Args:  cobra.ExactArgs(4),
+	Run: func(cmd *cobra.Command, args []string) {
+		nodeName := args[0]
+		vlanIDStr := args[1]
+		ipAddr := args[2]
+		maskStr := args[3]
+
+		if currentTopology == nil {
+			fmt.Println("Error: No topology loaded. Use 'load topology [filename]' first.")
+			return
+		}
+
+		// Find the node
+		var targetNode *Node
+		for _, node := range currentTopology.node_list {
+			if get_node_name(node) == nodeName {
+				targetNode = node
+				break
+			}
+		}
+
+		if targetNode == nil {
+			LogError("Node '%s' not found in topology", nodeName)
+			fmt.Printf("Error: Node '%s' not found in topology\n", nodeName)
+			return
+		}
+
+		// Parse VLAN ID
+		var vlanID uint16
+		_, err := fmt.Sscanf(vlanIDStr, "%d", &vlanID)
+		if err != nil || vlanID < VLAN_MIN || vlanID > VLAN_MAX {
+			fmt.Printf("Error: Invalid VLAN ID: %s (must be %d-%d)\n", vlanIDStr, VLAN_MIN, VLAN_MAX)
+			return
+		}
+
+		// Parse mask
+		var mask uint8
+		_, err = fmt.Sscanf(maskStr, "%d", &mask)
+		if err != nil || mask > 32 {
+			fmt.Printf("Error: Invalid mask: %s (must be 0-32)\n", maskStr)
+			return
+		}
+
+		// Add VLAN interface
+		success := targetNode.AddVlanInterface(vlanID, ipAddr, mask)
+		if !success {
+			fmt.Printf("Error: Failed to add VLAN %d interface to node %s\n", vlanID, nodeName)
+			return
+		}
+
+		fmt.Printf("✓ Successfully configured VLAN %d interface on node %s with IP %s/%d\n",
+			vlanID, nodeName, ipAddr, mask)
+		fmt.Printf("  Node %s can now route between VLANs\n", nodeName)
+	},
+}
+
+var pingCmd = &cobra.Command{
+	Use:   "ping [src-node] [dest-ip]",
+	Short: "Send a ping from source node to destination IP",
+	Args:  cobra.ExactArgs(2),
+	Run: func(cmd *cobra.Command, args []string) {
+		srcNodeName := args[0]
+		destIP := args[1]
+
+		if currentTopology == nil {
+			fmt.Println("Error: No topology loaded. Use 'load topology [filename]' first.")
+			return
+		}
+
+		// Find the source node
+		var srcNode *Node
+		for _, node := range currentTopology.node_list {
+			if get_node_name(node) == srcNodeName {
+				srcNode = node
+				break
+			}
+		}
+
+		if srcNode == nil {
+			LogError("Node '%s' not found in topology", srcNodeName)
+			fmt.Printf("Error: Node '%s' not found in topology\n", srcNodeName)
+			return
+		}
+
+		// Send ping
+		Layer5PingFunc(srcNode, destIP)
+	},
+}
+
+var eroPingCmd = &cobra.Command{
+	Use:   "ero-ping [src-node] [dest-ip] [ero-ip]",
+	Short: "Send a ping via Explicit Route Object (IP-in-IP tunnel through ERO)",
+	Long: `Send a ping packet encapsulated in IP-in-IP tunnel, forcing the packet
+to go through a specific intermediate node (ERO) before reaching the destination.
+Example: ero-ping R1 192.168.3.1 10.0.2.1
+This will send a ping from R1 to 192.168.3.1, tunneled through 10.0.2.1`,
+	Args: cobra.ExactArgs(3),
+	Run: func(cmd *cobra.Command, args []string) {
+		srcNodeName := args[0]
+		destIP := args[1]
+		eroIP := args[2]
+
+		if currentTopology == nil {
+			fmt.Println("Error: No topology loaded. Use 'load topology [filename]' first.")
+			return
+		}
+
+		// Find the source node
+		var srcNode *Node
+		for _, node := range currentTopology.node_list {
+			if get_node_name(node) == srcNodeName {
+				srcNode = node
+				break
+			}
+		}
+
+		if srcNode == nil {
+			LogError("Node '%s' not found in topology", srcNodeName)
+			fmt.Printf("Error: Node '%s' not found in topology\n", srcNodeName)
+			return
+		}
+
+		// Send ERO ping
+		Layer3EroPingFunc(srcNode, destIP, eroIP)
+	},
+}
+
+var enableRIPCmd = &cobra.Command{
+	Use:   "enable-rip [node-name]",
+	Short: "Enable RIP protocol on a node",
+	Args:  cobra.ExactArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		nodeName := args[0]
+
+		if currentTopology == nil {
+			fmt.Println("Error: No topology loaded.")
+			return
+		}
+
+		// Find the node
+		var targetNode *Node
+		for _, node := range currentTopology.node_list {
+			if get_node_name(node) == nodeName {
+				targetNode = node
+				break
+			}
+		}
+
+		if targetNode == nil {
+			fmt.Printf("Error: Node '%s' not found\n", nodeName)
+			return
+		}
+
+		// Enable RIP
+		targetNode.rip_state.StartRIP()
+		fmt.Printf("✓ RIP enabled on %s\n", nodeName)
+	},
+}
+
+var disableRIPCmd = &cobra.Command{
+	Use:   "disable-rip [node-name]",
+	Short: "Disable RIP protocol on a node",
+	Args:  cobra.ExactArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		nodeName := args[0]
+
+		if currentTopology == nil {
+			fmt.Println("Error: No topology loaded.")
+			return
+		}
+
+		// Find the node
+		var targetNode *Node
+		for _, node := range currentTopology.node_list {
+			if get_node_name(node) == nodeName {
+				targetNode = node
+				break
+			}
+		}
+
+		if targetNode == nil {
+			fmt.Printf("Error: Node '%s' not found\n", nodeName)
+			return
+		}
+
+		// Disable RIP
+		targetNode.rip_state.StopRIP()
+		fmt.Printf("RIP disabled on node %s\n", nodeName)
+	},
+}
+
+var showNodeRIPCmd = &cobra.Command{
+	Use:   "rip [node-name]",
+	Short: "Show RIP state for a node",
+	Args:  cobra.ExactArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		nodeName := args[0]
+
+		if currentTopology == nil {
+			fmt.Println("Error: No topology loaded.")
+			return
+		}
+
+		// Find the node
+		var targetNode *Node
+		for _, node := range currentTopology.node_list {
+			if get_node_name(node) == nodeName {
+				targetNode = node
+				break
+			}
+		}
+
+		if targetNode == nil {
+			fmt.Printf("Error: Node '%s' not found\n", nodeName)
+			return
+		}
+
+		// Show RIP state
+		targetNode.rip_state.DumpRIPState()
+	},
+}
+
 var loadTopologyCmd = &cobra.Command{
 	Use:   "topology [filename]",
 	Short: "Load topology from YAML file",
@@ -126,28 +476,24 @@ var loadTopologyCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		filename := "topologies/triangle.yaml"
 		if len(args) > 0 {
-			filename = args[0]
-		}
+		filename = args[0]
+	}
 
-		LogInfo("Loading topology: %s...", filename)
-		fmt.Printf("Loading topology: %s...\n", filename)
-		topology, err := load_topology_from_yaml(filename)
-		if err != nil {
-			LogError("Error loading topology: %v", err)
-			fmt.Printf("Error loading topology: %v\n", err)
-			return
-		}
+	fmt.Printf("Loading topology: %s...\n", filename)
+	topology, err := load_topology_from_yaml(filename)
+	if err != nil {
+		LogError("Error loading topology: %v", err)
+		fmt.Printf("✗ Error loading topology: %v\n", err)
+		return
+	}
 
-		// Stop any existing UDP monitoring
-		if udpStopChannels != nil {
-			stop_udp_monitoring(udpStopChannels)
-		}
+	// Stop any existing UDP monitoring
+	if udpStopChannels != nil {
+		stop_udp_monitoring(udpStopChannels)
+	}
 
-		currentTopology = topology
-		LogInfo("Successfully loaded topology: %s", get_topology_name(topology))
-		fmt.Printf("Successfully loaded topology: %s\n", get_topology_name(topology))
-
-		// Start UDP monitoring for all nodes in the topology (runs in background)
+	currentTopology = topology
+	fmt.Printf("✓ Loaded topology: %s\n", get_topology_name(topology))		// Start UDP monitoring for all nodes in the topology (runs in background)
 		udpStopChannels = start_udp_monitoring(topology)
 		fmt.Printf("UDP monitoring started for all nodes\n")
 	},
@@ -249,7 +595,14 @@ func executeCommand(input string) {
 			fmt.Println("  load topology [file]                       - Load topology from YAML file (default: topologies/triangle.yaml)")
 			fmt.Println("  show topology                              - Display loaded network topology")
 			fmt.Println("  show node mac <node-name>                  - Show MAC address table for a node")
+			fmt.Println("  show node route <node-name>                - Show routing table for a node")
+			fmt.Println("  show node arp <node-name>                  - Show ARP table for a node")
+			fmt.Println("  show node rip <node-name>                  - Show RIP state for a node")
 			fmt.Println("  run node resolve-arp <node-name> <ip-addr> - Resolve ARP for IP address on specified node")
+			fmt.Println("  run node add-route <node> <dest/mask> <gw> <oif> - Add a route to node's routing table")
+			fmt.Println("  run node ping <src-node> <dest-ip>         - Send ping from source node to destination IP")
+			fmt.Println("  run node enable-rip <node-name>            - Enable RIP protocol on a node")
+			fmt.Println("  run node disable-rip <node-name>           - Disable RIP protocol on a node")
 			fmt.Println("  help                                       - Show this help message")
 			fmt.Println("  exit                                       - Exit the shell")
 		},
@@ -267,9 +620,18 @@ func init() {
 	showCmd.AddCommand(showTopologyCmd)
 	showCmd.AddCommand(showNodeCmd)
 	showNodeCmd.AddCommand(showNodeMacCmd)
+	showNodeCmd.AddCommand(showNodeRouteCmd)
+	showNodeCmd.AddCommand(showNodeArpCmd)
+	showNodeCmd.AddCommand(showNodeRIPCmd)
 	loadCmd.AddCommand(loadTopologyCmd)
 	runCmd.AddCommand(runNodeCmd)
 	runNodeCmd.AddCommand(resolveArpCmd)
+	runNodeCmd.AddCommand(addRouteCmd)
+	runNodeCmd.AddCommand(addVlanInterfaceCmd)
+	runNodeCmd.AddCommand(pingCmd)
+	runNodeCmd.AddCommand(eroPingCmd)
+	runNodeCmd.AddCommand(enableRIPCmd)
+	runNodeCmd.AddCommand(disableRIPCmd)
 }
 
 func main() {

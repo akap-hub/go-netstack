@@ -100,7 +100,14 @@ func (intf *Interface) GetVLANMode() IntfMode {
 }
 
 func (intf *Interface) SetAccessVLAN(vlan_id uint16) bool {
-	if intf == nil || vlan_id < VLAN_MIN || vlan_id > VLAN_MAX {
+	if intf == nil {
+		return false
+	}
+	
+	// MANDATORY: ACCESS mode requires a valid VLAN ID
+	if vlan_id < VLAN_MIN || vlan_id > VLAN_MAX {
+		LogError("Cannot set ACCESS mode: invalid VLAN ID %d (must be %d-%d)", 
+			vlan_id, VLAN_MIN, VLAN_MAX)
 		return false
 	}
 
@@ -142,7 +149,14 @@ func (intf *Interface) IsVLANAllowed(vlan_id uint16) bool {
 	}
 
 	// Access mode allows only its configured VLAN
+	// MANDATORY: ACCESS mode interface MUST have a valid VLAN configured
 	if intf.intf_nw_props.mode == INTF_MODE_ACCESS {
+		// If access_vlan is 0, it's misconfigured - reject all frames
+		if intf.intf_nw_props.access_vlan == 0 {
+			LogWarn("Interface %s in ACCESS mode has no VLAN configured - dropping frame", 
+				get_interface_name(intf))
+			return false
+		}
 		return vlan_id == intf.intf_nw_props.access_vlan
 	}
 
@@ -308,8 +322,14 @@ func SetInterfaceL2Mode(intf *Interface, mode IntfMode, vlan_id uint16, native_v
 	// Configure based on mode
 	if mode == INTF_MODE_ACCESS {
 		// Access mode: single VLAN, untagged
+		// MANDATORY: ACCESS mode MUST have a valid VLAN ID
 		if vlan_id < VLAN_MIN || vlan_id > VLAN_MAX {
-			LogError("SetInterfaceL2Mode: Invalid VLAN ID %d", vlan_id)
+			LogError("SetInterfaceL2Mode: ACCESS mode requires valid VLAN ID (got %d, must be %d-%d)", 
+				vlan_id, VLAN_MIN, VLAN_MAX)
+			return false
+		}
+		if vlan_id == 0 {
+			LogError("SetInterfaceL2Mode: ACCESS mode interface MUST have a VLAN configured (cannot be 0)")
 			return false
 		}
 		intf.intf_nw_props.mode = INTF_MODE_ACCESS
@@ -392,7 +412,26 @@ func node_set_intf_ip_address(node *Node, local_if string, ip_addr string, mask 
 	}
 
 	// Set the IP configuration
-	return intf.SetIPConfig(ip_addr, mask)
+	if !intf.SetIPConfig(ip_addr, mask) {
+		return false
+	}
+
+	// Automatically add direct route for the subnet with interface name
+	if node.node_nw_prop.rt_table != nil {
+		// For direct routes, we store the interface name for reference
+		// Gateway IP is empty for direct routes
+		err := node.node_nw_prop.rt_table.AddRoute(ip_addr, mask, "", local_if)
+		if err != nil {
+			LogError("Failed to add direct route for %s/%d on node %s: %v",
+				ip_addr, mask, get_node_name(node), err)
+			// Don't fail the whole operation just because route add failed
+		} else {
+			LogInfo("Added direct route for %s/%d on interface %s on node %s",
+				ip_addr, mask, local_if, get_node_name(node))
+		}
+	}
+
+	return true
 }
 
 // Node method implementations for loopback configuration

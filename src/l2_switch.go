@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"sync"
 	"time"
@@ -333,9 +334,12 @@ func l2_switch_forward_frame_vlan(node *Node, recv_intf *Interface, pkt []byte, 
 		return
 	}
 
-	// Check if output interface allows this VLAN
+	// MANDATORY: Check if output interface allows this VLAN
+	// For ACCESS mode: interface MUST have a VLAN configured and match
+	// For TRUNK mode: VLAN must be in allowed list
 	if !oif.IsVLANAllowed(vlan_id) {
-		LogDebug("L2Switch: Node %s: VLAN %d not allowed on interface %s", node_name, vlan_id, oif_name)
+		LogDebug("L2Switch: Node %s: VLAN %d not allowed on output interface %s - dropping frame", 
+			node_name, vlan_id, oif_name)
 		return
 	}
 
@@ -388,7 +392,9 @@ func l2_switch_flood_frame_vlan(node *Node, exempted_intf *Interface, pkt []byte
 			continue
 		}
 
-		// Skip if this VLAN is not allowed on this interface
+		// MANDATORY: Skip if this VLAN is not allowed on this interface
+		// For ACCESS mode: only flood if VLAN matches configured VLAN
+		// For TRUNK mode: only flood if VLAN is in allowed list
 		if !intf.IsVLANAllowed(vlan_id) {
 			continue
 		}
@@ -435,9 +441,11 @@ func l2_switch_recv_frame(node *Node, iif *Interface, pkt []byte, pkt_size int) 
 	// Determine VLAN ID based on interface mode and frame content
 	vlan_id := determine_frame_vlan(iif, pkt)
 
-	// Check if VLAN is allowed on incoming interface
+	// MANDATORY: Check if VLAN is allowed on incoming interface
+	// For ACCESS mode: interface MUST have a VLAN configured
+	// For TRUNK mode: VLAN must be in allowed list
 	if !iif.IsVLANAllowed(vlan_id) {
-		LogDebug("L2Switch: Node %s: VLAN %d not allowed on interface %s - dropping",
+		LogDebug("L2Switch: Node %s: VLAN %d not allowed on interface %s - dropping frame",
 			node_name, vlan_id, iif_name)
 		return
 	}
@@ -454,6 +462,30 @@ func l2_switch_recv_frame(node *Node, iif *Interface, pkt []byte, pkt_size int) 
 
 	// Perform VLAN-aware MAC learning (learn source MAC + VLAN on incoming interface)
 	l2_switch_perform_mac_learning_vlan(node, &eth_hdr.src_mac, vlan_id, iif_name)
+
+	// Check if this is an ARP packet for one of our VLAN interfaces (SVI)
+	// L2 switches with SVIs need to respond to ARP requests for their VLAN gateway IPs
+	if eth_hdr.ethertype == ETHERTYPE_ARP {
+		// Process ARP - this will handle both flooding and local processing
+		layer_2_frame_recv_arp(node, iif, pkt, pkt_size)
+		// Note: ARP processing will also flood to other ports if needed
+		return
+	}
+
+	// Check if this frame needs inter-VLAN routing
+	// This happens when:
+	// 1. Frame is an IP packet (EtherType 0x0800)
+	// 2. Destination IP belongs to a different VLAN that has an SVI configured on this node
+	if eth_hdr.ethertype == ETHERTYPE_IP {
+		LogDebug("L2Switch: IP packet detected on VLAN %d, checking if inter-VLAN routing needed", vlan_id)
+		if should_route_between_vlans(node, pkt, vlan_id) {
+			LogInfo("L2Switch: Inter-VLAN routing triggered for VLAN %d", vlan_id)
+			// Route between VLANs instead of switching
+			route_between_vlans(node, iif, pkt, pkt_size, vlan_id)
+			return
+		}
+		LogDebug("L2Switch: No inter-VLAN routing needed, continuing with L2 switching")
+	}
 
 	// Forward the frame based on destination MAC within the VLAN
 	l2_switch_forward_frame_vlan(node, iif, pkt, pkt_size, vlan_id)
@@ -510,4 +542,196 @@ func stop_mac_table_cleanup(node *Node) {
 	// Close channel
 	close(node.mac_cleanup_stop_ch)
 	node.mac_cleanup_stop_ch = nil
+}
+
+// ====== Inter-VLAN Routing (SVI) ======
+
+// should_route_between_vlans checks if a frame needs inter-VLAN routing
+// Returns true if:
+// 1. The frame contains an IP packet
+// 2. The destination IP belongs to a different VLAN
+// 3. This node has an SVI configured for the destination VLAN
+func should_route_between_vlans(node *Node, pkt []byte, src_vlan uint16) bool {
+	if node == nil || pkt == nil {
+		return false
+	}
+
+	// Extract IP header from the frame
+	// Skip Ethernet header (14 bytes) or VLAN-tagged Ethernet header (18 bytes)
+	ip_offset := ETHERNET_HDR_SIZE
+	if len(pkt) >= VLAN_HEADER_SIZE && pkt[12] == 0x81 && pkt[13] == 0x00 {
+		ip_offset = VLAN_HEADER_SIZE
+	}
+
+	if len(pkt) < ip_offset+20 {
+		LogDebug("should_route: packet too small")
+		return false // Not enough data for IP header
+	}
+
+	// Extract destination IP address (offset 16-19 in IP header)
+	dst_ip := [4]byte{
+		pkt[ip_offset+16],
+		pkt[ip_offset+17],
+		pkt[ip_offset+18],
+		pkt[ip_offset+19],
+	}
+
+	LogDebug("should_route: checking dst_ip=%d.%d.%d.%d, src_vlan=%d", 
+		dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], src_vlan)
+
+	// Check each VLAN interface to see if destination IP belongs to it
+	if node.node_nw_prop.vlan_interfaces == nil {
+		LogDebug("should_route: no VLAN interfaces configured")
+		return false
+	}
+
+	for vlan_id, vlan_intf := range node.node_nw_prop.vlan_interfaces {
+		// Skip source VLAN (same VLAN doesn't need routing)
+		if vlan_id == src_vlan {
+			LogDebug("should_route: skipping source VLAN %d", vlan_id)
+			continue
+		}
+
+		LogDebug("should_route: checking VLAN %d (%s/%d)", 
+			vlan_id, vlan_intf.ip_addr.String(), vlan_intf.mask)
+
+		// Check if destination IP is in this VLAN's subnet
+		if ip_in_subnet(dst_ip, vlan_intf.ip_addr, vlan_intf.mask) {
+			LogInfo("should_route: YES! dst_ip in VLAN %d subnet", vlan_id)
+			return true
+		}
+	}
+
+	LogDebug("should_route: NO - destination not in any other VLAN")
+	return false
+}
+
+// ip_in_subnet checks if an IP address is in the given subnet
+func ip_in_subnet(ip [4]byte, subnet_ip IpAddr, mask byte) bool {
+	LogDebug("ip_in_subnet: checking if %d.%d.%d.%d is in %s/%d", 
+		ip[0], ip[1], ip[2], ip[3], subnet_ip.String(), mask)
+	
+	// Apply mask to both IPs and compare
+	for i := 0; i < 4; i++ {
+		// Calculate which bits of this byte need to be masked
+		// For /24: bytes 0,1,2 are fully masked, byte 3 is not masked
+		bits_used := int(mask) - (i * 8)
+		
+		var mask_bits byte
+		if bits_used >= 8 {
+			// Fully mask this byte
+			mask_bits = 0xFF
+		} else if bits_used > 0 {
+			// Partially mask this byte
+			mask_bits = byte(0xFF << (8 - bits_used))
+		} else {
+			// Don't mask this byte
+			mask_bits = 0
+		}
+
+		LogDebug("ip_in_subnet: byte[%d]: ip=%d & mask_bits=%d = %d, subnet=%d & mask_bits=%d = %d",
+			i, ip[i], mask_bits, ip[i] & mask_bits, subnet_ip[i], mask_bits, subnet_ip[i] & mask_bits)
+
+		if (ip[i] & mask_bits) != (subnet_ip[i] & mask_bits) {
+			LogDebug("ip_in_subnet: NO MATCH at byte %d", i)
+			return false
+		}
+	}
+	LogDebug("ip_in_subnet: MATCH!")
+	return true
+}
+
+// route_between_vlans handles routing an IP packet from one VLAN to another
+// This implements inter-VLAN routing (SVI functionality)
+func route_between_vlans(node *Node, iif *Interface, pkt []byte, pkt_size int, src_vlan uint16) {
+	if node == nil || pkt == nil {
+		return
+	}
+
+	node_name := get_node_name(node)
+
+	// Extract IP header
+	ip_offset := ETHERNET_HDR_SIZE
+	if len(pkt) >= VLAN_HEADER_SIZE && pkt[12] == 0x81 && pkt[13] == 0x00 {
+		ip_offset = VLAN_HEADER_SIZE
+	}
+
+	if len(pkt) < ip_offset+20 {
+		LogError("InterVLAN: Node %s: Packet too small for IP header", node_name)
+		return
+	}
+
+	// Extract destination IP
+	dst_ip := [4]byte{
+		pkt[ip_offset+16],
+		pkt[ip_offset+17],
+		pkt[ip_offset+18],
+		pkt[ip_offset+19],
+	}
+
+	// Find destination VLAN
+	var dest_vlan uint16
+	var dest_vlan_intf *VlanInterface
+	for vlan_id, vlan_intf := range node.node_nw_prop.vlan_interfaces {
+		if vlan_id != src_vlan && ip_in_subnet(dst_ip, vlan_intf.ip_addr, vlan_intf.mask) {
+			dest_vlan = vlan_id
+			dest_vlan_intf = vlan_intf
+			break
+		}
+	}
+
+	if dest_vlan_intf == nil {
+		LogDebug("InterVLAN: Node %s: No destination VLAN found for %d.%d.%d.%d",
+			node_name, dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3])
+		return
+	}
+
+	LogInfo("→ InterVLAN Routing: %s routing packet from VLAN %d to VLAN %d (dst: %d.%d.%d.%d)",
+		node_name, src_vlan, dest_vlan, dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3])
+
+	// Extract IP packet (strip Ethernet/VLAN headers)
+	ip_pkt := pkt[ip_offset:]
+
+	// Decrement TTL
+	if ip_pkt[8] <= 1 {
+		LogDebug("InterVLAN: Node %s: TTL expired, dropping packet", node_name)
+		return
+	}
+	ip_pkt[8]-- // Decrement TTL
+
+	// We need to forward this IP packet to the destination VLAN
+	// Find an interface in the destination VLAN to use for ARP/forwarding
+	var dest_intf *Interface
+	for i := 0; i < MAX_INTF_PER_NODE; i++ {
+		intf := node.intf[i]
+		if intf == nil {
+			continue
+		}
+		// Check if this interface is in the destination VLAN
+		if intf.GetVLANMode() == INTF_MODE_ACCESS && intf.GetAccessVLAN() == dest_vlan {
+			dest_intf = intf
+			break
+		}
+	}
+
+	if dest_intf == nil {
+		LogError("InterVLAN: Node %s: No interface found for destination VLAN %d",
+			node_name, dest_vlan)
+		return
+	}
+
+	// Use DemotePacketToLayer2 which handles ARP resolution and queuing automatically!
+	// Convert destination IP to uint32 for the function
+	dst_ip_uint32 := binary.BigEndian.Uint32(dst_ip[:])
+	
+	// Get interface name
+	dest_intf_name := get_interface_name(dest_intf)
+
+	LogInfo("→ InterVLAN: Forwarding to VLAN %d via interface %s", dest_vlan, dest_intf_name)
+
+	// This will:
+	// 1. Look up ARP entry for destination
+	// 2. If found: build Ethernet frame and send
+	// 3. If not found: queue packet and trigger ARP request (on-demand ARP!)
+	DemotePacketToLayer2(node, dst_ip_uint32, dest_intf_name, ip_pkt, len(ip_pkt), ETHERTYPE_IP)
 }

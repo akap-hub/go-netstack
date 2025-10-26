@@ -84,12 +84,8 @@ func monitor_node_udp_socket(node *Node, stopChan <-chan bool) {
 			// Calculate actual packet size (exclude auxiliary data)
 			pkt_size := n - IF_NAME_SIZE
 
-			// Shift buffer to skip auxiliary data and get pointer to actual packet
-			pkt_data := packet_buffer_shift_right(buffer, pkt_size, len(buffer))
-			if pkt_data == nil {
-				LogWarn("Failed to shift packet buffer on node %s", nodeName)
-				continue
-			}
+			// Skip auxiliary data (IF_NAME_SIZE bytes) to get actual packet
+			pkt_data := buffer[IF_NAME_SIZE:n]
 
 			// Enter Layer 2
 			layer_2_frame_recv(node, intf, pkt_data, pkt_size)
